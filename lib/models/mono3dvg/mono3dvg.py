@@ -36,6 +36,8 @@ class Mono3DVG(nn.Module):
                  aux_loss=True, with_box_refine=False, init_box=False,
                  text_encoder_type="roberta-base",
                  freeze_text_encoder=False,
+                 text_mamba_layers=1,
+                 text_mamba_kernel_size=3,
                  ):
         """ Initializes the model.
         Parameters:
@@ -138,6 +140,12 @@ class Mono3DVG(nn.Module):
             output_feat_size=hidden_dim,
             dropout=self.expander_dropout,
         )
+        self.text_mamba = MambaLanguageEncoder(
+            d_model=hidden_dim,
+            num_layers=text_mamba_layers,
+            kernel_size=text_mamba_kernel_size,
+            dropout=self.expander_dropout,
+        )
 
     def forward(self, images, calibs,  img_sizes, text, im_name, instanceID, ann_id):
         """ The forward expects a NestedTensor, which consists of:
@@ -187,6 +195,7 @@ class Mono3DVG(nn.Module):
 
         # permute LenxBxDim to BxLenxDim
         text_memory_resized = text_memory_resized.permute(1, 0, 2)
+        text_memory_resized = self.text_mamba(text_memory_resized, text_attention_mask)
 
         pred_depth_map_logits, depth_pos_embed, weighted_depth = self.depth_predictor(srcs, masks[1],
                                             pos[1],text_memory_resized, text_attention_mask, im_name, instanceID, ann_id)
@@ -545,6 +554,53 @@ class FeatureResizer(nn.Module):
         output = self.dropout(x)
         return output
 
+
+class MambaLanguageBlock(nn.Module):
+    """A lightweight Mamba-style sequence mixing block for text features."""
+
+    def __init__(self, d_model, kernel_size=3, dropout=0.1):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.in_proj = nn.Linear(d_model, d_model * 2)
+        self.dw_conv = nn.Conv1d(
+            d_model,
+            d_model,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=d_model,
+        )
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, text_attention_mask):
+        residual = x
+        x = self.norm(x)
+        x_proj, gate = self.in_proj(x).chunk(2, dim=-1)
+        x_proj = self.dw_conv(x_proj.transpose(1, 2)).transpose(1, 2)
+        x_proj = F.silu(x_proj)
+        x = self.out_proj(x_proj * torch.sigmoid(gate))
+        x = self.dropout(x)
+
+        if text_attention_mask is not None:
+            valid_mask = (~text_attention_mask).unsqueeze(-1).to(dtype=x.dtype)
+            x = x * valid_mask
+
+        return residual + x
+
+
+class MambaLanguageEncoder(nn.Module):
+    def __init__(self, d_model, num_layers=1, kernel_size=3, dropout=0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            MambaLanguageBlock(d_model, kernel_size=kernel_size, dropout=dropout)
+            for _ in range(max(1, num_layers))
+        ])
+
+    def forward(self, x, text_attention_mask=None):
+        for layer in self.layers:
+            x = layer(x, text_attention_mask)
+        return x
+
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
 
@@ -582,6 +638,8 @@ def build(cfg):
         with_box_refine=cfg['with_box_refine'],
         init_box=cfg['init_box'],
         freeze_text_encoder=cfg['freeze_text_encoder'],
+        text_mamba_layers=cfg.get('text_mamba_layers', 1),
+        text_mamba_kernel_size=cfg.get('text_mamba_kernel_size', 3),
     )
 
     # matcher
