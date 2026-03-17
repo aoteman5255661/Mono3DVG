@@ -55,9 +55,12 @@ model:
   enc_n_points: 4
   dec_n_points: 4
   freeze_text_encoder: True
+  text_mamba_layers: 2
+  text_mamba_kernel_size: 3
+  text_mamba_use_ssm: True
 
   # Loss
-  aux_loss: False
+  aux_loss: True
 
   # Loss coefficients
   cls_loss_coef: 2
